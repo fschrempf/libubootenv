@@ -41,6 +41,9 @@ struct uboot_env_device {
  */
 int libuboot_read_config(struct uboot_ctx *ctx, const char *config);
 
+int libuboot_parse_devicetree(struct uboot_ctx *ctx);
+
+
 /** @brief Read U-Boot environment configuration from structure
  *
  * @param[in] ctx libuboot context

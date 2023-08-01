@@ -51,6 +51,36 @@
 	    ((tvar) = LIST_NEXT((var), field), 1);			\
 	    (var) = (tvar))
 
+enum env_location {
+	ENVL_UNKNOWN,
+	ENVL_EEPROM,
+	ENVL_EXT4,
+	ENVL_FAT,
+	ENVL_FLASH,
+	ENVL_MMC,
+	ENVL_NAND,
+	ENVL_NVRAM,
+	ENVL_ONENAND,
+	ENVL_REMOTE,
+	ENVL_SPI_FLASH,
+	ENVL_UBI,
+	ENVL_NOWHERE,
+
+	ENVL_COUNT,
+};
+
+#define uswap_32(x) \
+	((((x) & 0xff000000) >> 24) | \
+	 (((x) & 0x00ff0000) >>  8) | \
+	 (((x) & 0x0000ff00) <<  8) | \
+	 (((x) & 0x000000ff) << 24))
+
+#if LITTLE_ENDIAN
+	#define be32_to_cpu(x)		uswap_32(x)
+#else
+	#define be32_to_cpu(x)		(x)
+#endif
+
 /*
  * The lockfile is the same as defined in U-Boot for
  * the fw_printenv utilities
@@ -1185,6 +1215,192 @@ int libuboot_load_file(struct uboot_ctx *ctx, const char *filename)
 	}
 	fclose(fp);
 	free(buf);
+
+	return 0;
+}
+
+int libuboot_device_map_match(unsigned int location, unsigned int id1, unsigned int id2,
+			      bool redund, char **dev)
+{
+	FILE *fp;
+	char *line = NULL;
+	size_t bufsize = 0;
+	unsigned int _location, _id1, _id2;
+	int ret = 0;
+	bool first = true;
+
+	fp = fopen("/etc/fw_env_devmap.config", "r");
+	if (!fp)
+		return -EBADF;
+
+	while (getline(&line, &bufsize, fp) != -1) {
+		/* skip comments */
+		if (line[0] == '#')
+			continue;
+
+		ret = sscanf(line, "%u %u %u %ms", &_location, &_id1, &_id2, dev);
+		if (ret != 4 || _location != location || _id1 != id1 || _id2 != id2) {
+			if (dev)
+				free(*dev);
+			*dev = NULL;
+			continue;
+		}
+
+		/*
+		 * Skip the first entry and assume the second match is for
+		 * the redundand environment.
+		 */
+		if (redund && first) {
+			first = false;
+			continue;
+		}
+
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+int libuboot_read_u32_from_file(char *path, uint32_t *val)
+{
+	FILE *fp;
+	int ret;
+
+	fp = fopen(path, "r");
+	if(!fp)
+		return -ENODATA;
+
+	ret = fread(val, sizeof(uint32_t), 1, fp);
+	if (ret != 1) {
+		printf("%s:%d\n", __func__, __LINE__);
+		fclose(fp);
+		return -EINVAL;
+	}
+
+	fclose(fp);
+
+	*val =  be32_to_cpu(*val);
+	return 0;
+}
+
+int libuboot_guess_device(uint32_t location, uint32_t id1, uint32_t id2,
+			  struct uboot_ctx *ctx, char **dev)
+{
+	if (ctx->redundant && location == ENVL_MMC && id2 &&
+	    ctx->envdevs[0].offset == ctx->envdevs[1].offset) {
+		return asprintf(dev, "/dev/mmcblk%uboot%u", id1, id2);
+	} else if (location == ENVL_MMC) {
+		if (id2)
+			return asprintf(dev, "/dev/mmcblk%uboot%u", id1, id2 - 1);
+		else
+			return asprintf(dev, "/dev/mmcblk%u", id1);
+	} else if (location == ENVL_SPI_FLASH) {
+		return asprintf(dev, "/dev/mtd%u", id1);
+		/* TODO: Take partition names into account. */
+	}
+
+	return -EINVAL;
+}
+
+int libuboot_parse_devicetree(struct uboot_ctx *ctx)
+{
+	uint32_t location, id1 = 0, id2 = 0, temp;
+	char *dev;
+	int ret;
+
+	DIR* dir = opendir("/proc/device-tree/chosen/u-boot,env-config");
+	if (!dir)
+		return -ENODATA;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/location",
+					  &location);
+	if(ret)
+		return -EINVAL;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/offset",
+					  &temp);
+	if(ret)
+		return -EINVAL;
+
+	ctx->envdevs[0].offset = temp;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/size",
+					  &temp);
+	if(ret)
+		return -EINVAL;
+
+	ctx->envdevs[0].envsize = temp;
+	ctx->size = temp;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/sect_size",
+					  &temp);
+	if(ret)
+		return -EINVAL;
+
+	ctx->envdevs[0].sectorsize = temp;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/id1", &id1);
+	if(ret && ret != -ENODATA)
+		return -EINVAL;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-config/id2", &id2);
+	if(ret && ret != -ENODATA)
+		return -EINVAL;
+
+	ret = libuboot_device_map_match(location, id1, id2, false, &dev);
+	if (ret) {
+		/* No map file or no matching entry available, trying to guess. */
+		ret = libuboot_guess_device(location, id1, id2, ctx, &dev);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (normalize_device_path(dev, &ctx->envdevs[0]) < 0) {
+		free(dev);
+		return -EINVAL;
+	}
+
+	free(dev);
+
+	if (check_env_device(ctx, &ctx->envdevs[0]) < 0) {
+		return -EINVAL;
+	}
+
+	dir = opendir("/proc/device-tree/chosen/u-boot,env-redund-config");
+	if (!dir)
+		return 0;
+
+	ctx->redundant = true;
+
+	ret = libuboot_read_u32_from_file("/proc/device-tree/chosen/u-boot,env-redund-config/offset",
+					  &temp);
+	if(ret)
+		return -EINVAL;
+
+	ctx->envdevs[1].offset = temp;
+	ctx->envdevs[1].envsize = ctx->envdevs[0].envsize;
+	ctx->envdevs[1].sectorsize = ctx->envdevs[0].sectorsize;
+
+	ret = libuboot_device_map_match(location, id1, id2, true, &dev);
+	if (ret) {
+		/* No map file or no matching entry available, trying to guess. */
+		ret = libuboot_guess_device(location, id1, id2, ctx, &dev);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (normalize_device_path(dev, &ctx->envdevs[1]) < 0) {
+		free(dev);
+		return -EINVAL;
+	}
+
+	free(dev);
+
+	if (check_env_device(ctx, &ctx->envdevs[1]) < 0)
+		return -EINVAL;
+
+	if (!check_compatible_devices(ctx))
+		return -EINVAL;
 
 	return 0;
 }

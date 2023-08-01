@@ -118,8 +118,10 @@ int main (int argc, char **argv) {
 		cfgfname = "/etc/fw_env.config";
 
 	if ((ret = libuboot_read_config(ctx, cfgfname)) < 0) {
-		fprintf(stderr, "Configuration file wrong or corrupted\n");
-		exit (ret);
+		if ((ret = libuboot_parse_devicetree(ctx)) < 0) {
+			fprintf(stderr, "Failed to read config from any source\n");
+			exit (ret);
+		}
 	}
 
 	if (!defenvfile)
